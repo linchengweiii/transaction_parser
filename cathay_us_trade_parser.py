@@ -10,7 +10,6 @@ from gmail_helper import GmailHelper
 
 class CathayUSTradeParser(TradeParser):
     CURRENCIES = {"USD", "TWD"}
-    MARKET_MAP = {"美國": "US"}
     TRADETYPE_MAP = {"買進": "purchase", "賣出": "sale", "除息": "dividend"}
 
     def __init__(
@@ -177,12 +176,10 @@ class CathayUSTradeParser(TradeParser):
 
     # ---------- projection ----------
     def _project_row(self, r: Dict[str, Any]) -> Dict[str, Any]:
-        market = self.MARKET_MAP.get(r.get("Market", ""), r.get("Market", ""))
         trade_type = self.TRADETYPE_MAP.get(r.get("TradeType", ""), r.get("TradeType", ""))
 
         return {
-            "product": r.get("Product", ""),
-            "market": market,
+            "symbol": r.get("Product", ""),  # symbol replaces product
             "trade_type": trade_type,
             "currency": r.get("Currency", ""),
             "shares": self._to_num(r.get("Shares")),
