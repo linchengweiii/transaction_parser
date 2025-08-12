@@ -10,7 +10,7 @@ from gmail_helper import GmailHelper
 
 class CathayUSTradeParser(TradeParser):
     CURRENCIES = {"USD", "TWD"}
-    TRADETYPE_MAP = {"買進": "purchase", "賣出": "sale", "除息": "dividend"}
+    TRADETYPE_MAP = {"買進": "buy", "賣出": "sell", "除息": "dividend"}
 
     def __init__(
         self,
