@@ -1,0 +1,276 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+import base64
+import re
+import shutil
+
+from bs4 import BeautifulSoup  # requires bs4 at runtime
+
+from trade_parser import TradeParser
+from gmail_helper import GmailHelper
+
+
+class SchwabTradeParser(TradeParser):
+    
+    """
+    Parses Charles Schwab eConfirm emails.
+    - Searches Gmail for eConfirms
+    - Extracts HTML/text bodies
+    - Parses symbol, action (buy/sell), shares, price, fee, settlement date, total
+    Returns a list of JSON records compatible with the other parsers.
+    """
+    DEFAULT_QUERY = 'from:(donotreply@mail.schwab.com) eConfirms'
+
+    def __init__(
+        self,
+        gmail: GmailHelper,
+        save_dir: Path | str,
+        trace_back_days: Optional[int] = None,
+    ) -> None:
+        self.gmail = gmail
+        self.save_dir = Path(save_dir)
+        if trace_back_days is not None and trace_back_days > 0:
+            self.query = f"{self.DEFAULT_QUERY} newer_than:{trace_back_days}d"
+        else:
+            self.query = self.DEFAULT_QUERY
+
+    # ---------- public API ----------
+    def parse(self) -> List[Dict[str, Any]]:
+        """
+        Search, fetch HTML bodies, parse them, and return normalized rows.
+        """
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        msg_ids = self.gmail.search_messages("me", self.query)
+        if not msg_ids:
+            print("Schwab: No messages found matching query.")
+            return []
+
+        all_rows: List[Dict[str, Any]] = []
+        for mid in msg_ids:
+            html, text = self._get_message_bodies(mid)
+            if not html and not text:
+                # Last resort: dump raw and skip parsing
+                raw = self.gmail.service.users().messages().get(
+                    userId="me",
+                    id=mid,
+                    format="raw"
+                ).execute()
+                raw_bytes = base64.urlsafe_b64decode(raw.get("raw", "").encode("utf-8"))
+                eml_path = GmailHelper._unique_path(self.save_dir / f"schwab_{mid}.eml")
+                eml_path.write_bytes(raw_bytes)
+                print(f"Schwab: saved raw .eml for message {mid} (no parseable body).")
+                continue
+
+            # Optionally save a copy for debugging
+            if html:
+                path = GmailHelper._unique_path(self.save_dir / f"schwab_{mid}.html")
+                path.write_text(html, encoding="utf-8")
+            elif text:
+                path = GmailHelper._unique_path(self.save_dir / f"schwab_{mid}.txt")
+                path.write_text(text, encoding="utf-8")
+
+            body_text = html or text or ""
+            rows = self._parse_body(body_text)
+            all_rows.extend(rows)
+
+        # remove the save_dir after successfully parsing
+        try:
+            shutil.rmtree(self.save_dir)
+        except Exception as e:
+            print(f"Warning: failed to remove temp dir {self.save_dir}: {e}")
+
+        return all_rows
+
+    # ---------- internals ----------
+    def _get_message_bodies(self, msg_id: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Return (html, text) bodies for the message, if present.
+        Prefers parts labeled 'text/html' or 'text/plain'. Decodes base64url.
+        """
+        msg = self.gmail.service.users().messages().get(
+            userId="me",
+            id=msg_id,
+            format="full"
+        ).execute()
+        payload = msg.get("payload", {}) or {}
+
+        html: Optional[str] = None
+        text: Optional[str] = None
+
+        # Walk all parts (handles nested multiparts)
+        for part in GmailHelper._walk_parts(payload):
+            mime = (part.get("mimeType") or "").lower()
+            if mime not in ("text/html", "text/plain"):
+                continue
+            body = (part.get("body") or {})
+            data = body.get("data")
+            if not data:
+                # If attachmentId is present for a text part (rare), fetch it
+                att_id = body.get("attachmentId")
+                if att_id:
+                    att = (
+                        self.gmail.service.users()
+                        .messages()
+                        .attachments()
+                        .get(userId="me", messageId=msg_id, id=att_id)
+                        .execute()
+                    )
+                    data = att.get("data")
+            if not data:
+                continue
+
+            try:
+                raw = base64.urlsafe_b64decode(data.encode("utf-8"))
+                decoded = raw.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+
+            if mime == "text/html":
+                html = (html or "") + decoded
+            elif mime == "text/plain":
+                text = (text or "") + decoded
+
+        # Some messages may place the body directly at the top level (no parts)
+        if not html and not text:
+            body = (payload.get("body") or {})
+            data = body.get("data")
+            if data:
+                try:
+                    raw = base64.urlsafe_b64decode(data.encode("utf-8"))
+                    decoded = raw.decode("utf-8", errors="replace")
+                    if "<html" in decoded.lower() or "</p>" in decoded.lower():
+                        html = decoded
+                    else:
+                        text = decoded
+                except Exception:
+                    pass
+
+        return html, text
+
+    # --------- parsing helpers ---------
+    def _parse_body(self, html_or_text: str) -> List[Dict[str, Any]]:
+        """
+        Parse one eConfirm body (HTML or text) into zero or more trade rows.
+        Handles typical Schwab eConfirm structure containing:
+          Symbol: <SYM> ... Trade Date: mm/dd/yy Settle Date: mm/dd/yy
+          Quantity Price Principal Charge and/or Interest Total Amount
+        """
+        # Convert HTML to text if needed
+        if "<" in html_or_text and "</" in html_or_text:
+            soup = BeautifulSoup(html_or_text, "html.parser")
+            text = soup.get_text(" ", strip=True)
+        else:
+            text = " ".join(html_or_text.split())
+
+        records: List[Dict[str, Any]] = []
+
+        # Find all occurrences starting at "Symbol:" to support multiple trades per body
+        for m in re.finditer(r"Symbol:\s*([A-Z\.\-]+)", text):
+            sym = m.group(1)
+            window = text[m.start(): m.start() + 800]  # parse within a localized window
+
+
+            # Action (buy/sell)
+            action = None
+            mp = re.search(r"\bPurchase\b", window, re.I)
+            ms = re.search(r"\bSale\b", window, re.I)
+            if mp and ms:
+                action = "sell" if ms.start() <= mp.start() else "buy"
+            elif ms:
+                action = "sell"
+            elif mp:
+                action = "buy"
+            # Dates
+            trade_date = self._search(window, r"Trade Date:\s*([0-9]{2}/[0-9]{2}/[0-9]{2,4})")
+            settle_date = self._search(window, r"Settle Date:\s*([0-9]{2}/[0-9]{2}/[0-9]{2,4})")
+
+            # Table numbers: Quantity Price Principal Charge and/or Interest Total Amount
+            qty = price = principal = fee = total = None
+            # First try strict header layout
+            hdr_pat = (
+                r"Quantity\s+Price\s+Principal\s+Charge and/or Interest\s+Total Amount\s+"
+                r"(?P<qty>[\d,\.]+)\s+\$?(?P<price>[\d,]+\.\d{2})\s+\$?(?P<principal>[\d,]+\.\d{2})\s+"
+                r"(?P<fee>N/A|\$?[\d,]+\.\d{2})\s+\$?(?P<total>[\d,]+\.\d{2})"
+            )
+            mh = re.search(hdr_pat, window)
+            if mh:
+                qty = self._to_num(mh.group("qty"))
+                price = self._to_money(mh.group("price"))
+                principal = self._to_money(mh.group("principal"))
+                fee = self._to_money(mh.group("fee"))
+                total = self._to_money(mh.group("total"))
+            else:
+                # Fallback: scan for first 5 numerical tokens after header
+                m2 = re.search(r"Quantity\s+Price\s+Principal.*?Total Amount\s+(?P<tail>.+)$", window)
+                if m2:
+                    tail = m2.group("tail")[:120]
+                    tokens = re.findall(r"(N/A|-?\$[\d,]+\.\d{2}|-?[\d,]+(?:\.\d{2})?)", tail)
+                    if len(tokens) >= 5:
+                        qty = self._to_num(tokens[0])
+                        price = self._to_money(tokens[1])
+                        principal = self._to_money(tokens[2])
+                        fee = self._to_money(tokens[3])
+                        total = self._to_money(tokens[4])
+
+            if sym and qty is not None and price is not None and (total is not None or principal is not None):
+                rec = {
+                    "symbol": sym,
+                    "trade_type": action or "",   # 'buy' or 'sell' when available
+                    "currency": "USD",
+                    "shares": qty,
+                    "price": price,
+                    "fee": fee if fee is not None else 0.0,
+                    "date": (self._normalize_date(settle_date) or self._normalize_date(trade_date) or ""),
+                    "total": total if total is not None else principal,
+                }
+                records.append(rec)
+
+        return records
+
+    @staticmethod
+    def _to_money(s: Optional[str]) -> Optional[float]:
+        if s is None:
+            return None
+        s = s.strip()
+        if s.upper() == "N/A":
+            return 0.0
+        s = s.replace("$", "").replace(",", "")
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _to_num(s: Optional[str]) -> Optional[float]:
+        if s is None:
+            return None
+        s = s.replace(",", "")
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+        
+    @staticmethod
+    def _normalize_date(s: Optional[str]) -> Optional[str]:
+        """Return date as YYYY/MM/DD; accepts mm/dd/yy or mm/dd/yyyy."""
+        if not s:
+            return None
+        import datetime as _dt
+        s = s.strip()
+        for fmt in ("%m/%d/%y", "%m/%d/%Y"):
+            try:
+                dt = _dt.datetime.strptime(s, fmt)
+                if dt.year < 2000:
+                    dt = dt.replace(year=dt.year + 100)
+                return dt.strftime("%Y/%m/%d")
+            except Exception:
+                pass
+        return s
+
+    @staticmethod
+    def _search(text: str, pattern: str) -> Optional[str]:
+        m = re.search(pattern, text)
+        return m.group(1) if m else None
