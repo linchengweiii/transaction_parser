@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import re
 import shutil
 import pdfplumber
@@ -34,7 +34,7 @@ class CathayTWTradeParser(TradeParser):
     def __init__(
         self,
         gmail: GmailHelper,
-        save_dir: Path | str,
+        save_dir: Union[Path, str],
         password: Optional[str] = None,
         trace_back_days: Optional[int] = None,
     ) -> None:

@@ -12,7 +12,16 @@ from schwab_trade_parser import SchwabTradeParser
 from portfolio_client import PortfolioClient
 
 
-def build_parsers(gmail: GmailHelper, save_dir: Path, pdf_password: str | None, trace_back_days: int) -> dict:
+from typing import Optional
+
+
+def build_parsers(
+    gmail: GmailHelper,
+    save_dir: Path,
+    pdf_password: Optional[str],
+    trace_back_days: int,
+    keep_artifacts: bool = False,
+) -> dict:
     return {
         "cathay_us": CathayUSTradeParser(
             gmail=gmail,
@@ -30,6 +39,7 @@ def build_parsers(gmail: GmailHelper, save_dir: Path, pdf_password: str | None, 
             gmail=gmail,
             save_dir=save_dir / "schwab",
             trace_back_days=trace_back_days,
+            keep_artifacts=keep_artifacts,
         ),
     }
 
@@ -67,12 +77,17 @@ def main():
                     help="Password for protected PDFs (TW/US if required).")
     ap.add_argument("--trace-back-days", type=int, default=100,
                     help="Limit Gmail search to newer_than:{days}d.")
+    # Backwards-compatible alias (common typo): --trace-back-day
+    ap.add_argument("--trace-back-day", dest="trace_back_days", type=int,
+                    help="Alias for --trace-back-days.")
 
     # API settings
     ap.add_argument("--api-base", default=os.getenv("PORTFOLIO_API_BASE"),
                     help="Portfolio API base URL. Can also be set via PORTFOLIO_API_BASE environment variable.")
     ap.add_argument("--push", action="store_true",
                     help="If set, push parsed trades to the portfolio API; otherwise print JSON for debugging.")
+    ap.add_argument("--keep-artifacts", action="store_true",
+                    help="Keep downloaded/saved artifacts (HTML/TXT/PDF) for debugging.")
 
     args = ap.parse_args()
 
@@ -84,6 +99,7 @@ def main():
         save_dir=args.save_dir,
         pdf_password=args.pdf_password,
         trace_back_days=args.trace_back_days,
+        keep_artifacts=args.keep_artifacts,
     )
 
     # Default portfolio names inferred from source

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 import base64
 import re
 import shutil
@@ -26,11 +26,13 @@ class SchwabTradeParser(TradeParser):
     def __init__(
         self,
         gmail: GmailHelper,
-        save_dir: Path | str,
+        save_dir: Union[Path, str],
         trace_back_days: Optional[int] = None,
+        keep_artifacts: bool = False,
     ) -> None:
         self.gmail = gmail
         self.save_dir = Path(save_dir)
+        self.keep_artifacts = keep_artifacts
         if trace_back_days is not None and trace_back_days > 0:
             self.query = f"{self.DEFAULT_QUERY} newer_than:{trace_back_days}d"
         else:
@@ -76,10 +78,11 @@ class SchwabTradeParser(TradeParser):
             all_rows.extend(rows)
 
         # remove the save_dir after successfully parsing
-        try:
-            shutil.rmtree(self.save_dir)
-        except Exception as e:
-            print(f"Warning: failed to remove temp dir {self.save_dir}: {e}")
+        if not self.keep_artifacts:
+            try:
+                shutil.rmtree(self.save_dir)
+            except Exception as e:
+                print(f"Warning: failed to remove temp dir {self.save_dir}: {e}")
 
         return all_rows
 
@@ -167,15 +170,18 @@ class SchwabTradeParser(TradeParser):
         records: List[Dict[str, Any]] = []
 
         # Find all occurrences starting at "Symbol:" to support multiple trades per body
-        for m in re.finditer(r"Symbol:\s*([A-Z\.\-]+)", text):
+        # Symbols can include digits, dots, dashes, and occasionally slashes
+        for m in re.finditer(r"Symbol:\s*([A-Z0-9\.\-/]+)", text):
             sym = m.group(1)
-            window = text[m.start(): m.start() + 800]  # parse within a localized window
+            # Parse within a localized window (grow a bit for safety)
+            window = text[m.start(): m.start() + 2000]
 
 
             # Action (buy/sell)
             action = None
-            mp = re.search(r"\bPurchase\b", window, re.I)
-            ms = re.search(r"\bSale\b", window, re.I)
+            # Handle Purchase/Buy/Bought and Sale/Sell/Sold variants
+            mp = re.search(r"\b(Purchase|Buy|Bought)\b", window, re.I)
+            ms = re.search(r"\b(Sale|Sell|Sold)\b", window, re.I)
             if mp and ms:
                 action = "sell" if ms.start() <= mp.start() else "buy"
             elif ms:
@@ -190,9 +196,9 @@ class SchwabTradeParser(TradeParser):
             qty = price = principal = fee = total = None
             # First try strict header layout
             hdr_pat = (
-                r"Quantity\s+Price\s+Principal\s+Charge and/or Interest\s+Total Amount\s+"
-                r"(?P<qty>[\d,\.]+)\s+\$?(?P<price>[\d,]+\.\d{2})\s+\$?(?P<principal>[\d,]+\.\d{2})\s+"
-                r"(?P<fee>N/A|\$?[\d,]+\.\d{2})\s+\$?(?P<total>[\d,]+\.\d{2})"
+                r"Quantity\s+Price\s+Principal\s+.*?(Total Amount|Net Amount)\s+"
+                r"(?P<qty>[\d,\.]+)\s+\$?(?P<price>[\d,]+\.\d{2,4})\s+\$?(?P<principal>[\d,]+\.\d{2})\s+"
+                r"(?P<fee>N/A|\$?[\d,]+\.\d{2}|\([\$\d,]+\.\d{2}\))\s+\$?(?P<total>[\d,]+\.\d{2}|\([\$\d,]+\.\d{2}\))"
             )
             mh = re.search(hdr_pat, window)
             if mh:
@@ -203,10 +209,11 @@ class SchwabTradeParser(TradeParser):
                 total = self._to_money(mh.group("total"))
             else:
                 # Fallback: scan for first 5 numerical tokens after header
-                m2 = re.search(r"Quantity\s+Price\s+Principal.*?Total Amount\s+(?P<tail>.+)$", window)
+                m2 = re.search(r"Quantity\s+Price\s+Principal.*?(Total Amount|Net Amount)\s+(?P<tail>.+)$", window)
                 if m2:
                     tail = m2.group("tail")[:120]
-                    tokens = re.findall(r"(N/A|-?\$[\d,]+\.\d{2}|-?[\d,]+(?:\.\d{2})?)", tail)
+                    # Capture N/A, negatives with leading '-', or parentheses like ($12.34)
+                    tokens = re.findall(r"(N/A|\([\$\d,]+(?:\.\d{2,4})?\)|-?\$[\d,]+\.\d{2,4}|-?[\d,]+(?:\.\d{2,4})?)", tail)
                     if len(tokens) >= 5:
                         qty = self._to_num(tokens[0])
                         price = self._to_money(tokens[1])
@@ -236,9 +243,16 @@ class SchwabTradeParser(TradeParser):
         s = s.strip()
         if s.upper() == "N/A":
             return 0.0
-        s = s.replace("$", "").replace(",", "")
+        # Handle parentheses for negatives and optional CR/DR suffixes
+        neg = False
+        if s.startswith("(") and s.endswith(")"):
+            neg = True
+            s = s[1:-1]
+        s = s.replace("CR", "").replace("DR", "")
+        s = s.replace("$", "").replace(",", "").strip()
         try:
-            return float(s)
+            val = float(s)
+            return -val if neg else val
         except Exception:
             return None
 
@@ -246,9 +260,15 @@ class SchwabTradeParser(TradeParser):
     def _to_num(s: Optional[str]) -> Optional[float]:
         if s is None:
             return None
+        s = s.strip()
+        neg = False
+        if s.startswith("(") and s.endswith(")"):
+            neg = True
+            s = s[1:-1]
         s = s.replace(",", "")
         try:
-            return float(s)
+            val = float(s)
+            return -val if neg else val
         except Exception:
             return None
 

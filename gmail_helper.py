@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Union
 
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
@@ -21,8 +21,8 @@ class GmailHelper:
 
     def __init__(
         self,
-        credentials_path: Path | str,
-        token_path: Path | str,
+        credentials_path: Union[Path, str],
+        token_path: Union[Path, str],
     ):
         self.credentials_path = Path(credentials_path)
         self.token_path = Path(token_path)
