@@ -201,39 +201,37 @@ class SchwabTradeParser(TradeParser):
 
             # Table numbers: Quantity Price Principal Charge and/or Interest Total Amount
             qty = price = principal = fee = total = None
-            # First try strict header layout
-            hdr_pat = (
-                r"Quantity\s+Price\s+Principal\s+.*?(Total Amount|Net Amount)\s+"
-                r"(?P<qty>[\d,\.]+)\s+\$?(?P<price>[\d,]+\.\d{2,4})\s+\$?(?P<principal>[\d,]+\.\d{2})\s+"
-                r"(?P<fee>N/A|\$?[\d,]+\.\d{2}|\([\$\d,]+\.\d{2}\))\s+\$?(?P<total>[\d,]+\.\d{2}|\([\$\d,]+\.\d{2}\))"
-            )
-            mh = re.search(hdr_pat, window)
-            if mh:
-                qty = self._to_num(mh.group("qty"))
-                price = self._to_money(mh.group("price"))
-                principal = self._to_money(mh.group("principal"))
-                fee = self._to_money(mh.group("fee"))
-                total = self._to_money(mh.group("total"))
-            else:
-                # Fallback: collect numeric tokens after the header and map by column ordering.
-                m2 = re.search(r"Quantity\s+Price\s+Principal.*?(Total Amount|Net Amount)\s+(?P<tail>.+)$", window)
-                if m2:
-                    tail = m2.group("tail")
-                    # Capture N/A, negatives, $-prefixed, and parentheses for negatives
-                    nums = re.findall(r"N/A|\([\$\d,]+(?:\.\d{2,4})?\)|-?\$[\d,]+\.\d{2,4}|-?[\d,]+(?:\.\d{2,4})?", tail)
-                    # Expected ordering within the row usually is:
-                    # qty, price, principal, [commission, fees..., fee_total], total_amount
-                    if len(nums) >= 4:
-                        qty = self._to_num(nums[0])
-                        price = self._to_money(nums[1])
-                        principal = self._to_money(nums[2])
-                        # Last numeric in the row should be total amount
-                        total = self._to_money(nums[-1])
-                        # Derive fee as difference when possible
-                        if principal is not None and total is not None:
-                            fee = round(abs(total) - abs(principal), 2)
+            # Prefer robust numeric extraction for the row beneath the headers.
+            qty, price, principal, total = self._extract_row_numbers(window)
+            # Extract fee from the Charge column when present (Commission, Industry Fee, etc.)
+            fee_from_block = self._extract_fee_from_window(window)
+            if fee_from_block is not None:
+                fee = fee_from_block
+            # If still unknown, infer fee as the difference between total and principal
+            if fee is None and principal is not None and total is not None:
+                try:
+                    fee = round(abs(total) - abs(principal), 2)
+                except Exception:
+                    pass
 
             if sym and qty is not None and price is not None and (total is not None or principal is not None):
+                # Compute cash amount prioritizing parsed total; otherwise derive from principal +/- fee by action
+                amount = total if total is not None else None
+                if amount is None and principal is not None:
+                    # If we have principal and fee, derive total based on action semantics
+                    eff_fee = fee if fee is not None else 0.0
+                    if (action or '').lower() == 'sell':
+                        amount = round(principal - eff_fee, 2)
+                    else:
+                        # Default and for buys: cash out equals principal + fees
+                        amount = round(principal + eff_fee, 2)
+                # Normalize cash flow sign: buys are cash out (negative), sells are cash in (positive)
+                if amount is not None and action:
+                    if action.lower() == "buy" and amount > 0:
+                        amount = -amount
+                    elif action.lower() == "sell" and amount < 0:
+                        amount = -amount
+
                 rec = {
                     "symbol": sym,
                     "trade_type": action or "",   # 'buy' or 'sell' when available
@@ -242,11 +240,105 @@ class SchwabTradeParser(TradeParser):
                     "price": price,
                     "fee": fee if fee is not None else 0.0,
                     "date": (self._normalize_date(settle_date) or self._normalize_date(trade_date) or ""),
-                    "total": total if total is not None else principal,
+                    "total": amount,
                 }
                 records.append(rec)
 
         return records
+
+    @staticmethod
+    def _extract_fee_from_window(window_text: str) -> Optional[float]:
+        """
+        Extract the Charge-and/or-Interest total for a single trade row from the
+        flattened text window. Handles options emails where the column lists
+        multiple items like Commission and Industry Fee with a 'Total: $X.XX'.
+
+        Strategy (in order):
+        1) Look for 'Charge and/or Interest ... Total: $X.XX' and return that value.
+        2) Sum known fee components (Commission, Industry Fee, Regulatory/ORF, etc.).
+        Returns None if nothing is confidently found.
+        """
+        if not window_text:
+            return None
+
+        # Normalize whitespace to simplify regex
+        w = " ".join(window_text.split())
+
+        # 1) Try to capture the explicit Total within the Charge column
+        m_total = re.search(r"Charge and/or Interest.*?Total:\s*\$?([\d,]+\.\d{2})", w, re.I)
+        if m_total:
+            try:
+                return float(m_total.group(1).replace(",", ""))
+            except Exception:
+                pass
+
+        # 2) Sum individual fee components commonly present in Schwab options emails
+        labels = [
+            "Commission",
+            "Industry Fee",
+            "Regulatory Fee",
+            "Options Regulatory Fee",
+            "Transaction Fee",
+            "Exchange Fee",
+            "Fees",  # sometimes shown as a single "Fees: $x.xx"
+        ]
+        total_fee = 0.0
+        found_any = False
+        for label in labels:
+            for m in re.finditer(rf"{label}:\s*\$?([\d,]+\.\d{2})", w, re.I):
+                try:
+                    amt = float(m.group(1).replace(",", ""))
+                    total_fee += amt
+                    found_any = True
+                except Exception:
+                    continue
+
+        return total_fee if found_any else None
+
+    @staticmethod
+    def _extract_row_numbers(window_text: str) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        """
+        Extract (qty, price, principal, total_amount) from the table segment under the
+        'Quantity Price Principal Charge and/or Interest Total Amount' headers.
+        Works for both equities and options where the Charge column has sub-items.
+        """
+        if not window_text:
+            return None, None, None, None
+
+        # Normalize whitespace to a single line for regex simplicity
+        w = " ".join(window_text.split())
+        # Try to capture the span after the header labels into the first data row.
+        # Stop early when common post-row phrases appear to avoid pulling unrelated numbers.
+        stop_markers = [
+            r"Additional information",
+            r"If you have any questions",
+            r"We will hold this",
+            r"Schwab acted as your agent",
+            r"Notice: All email",
+            r"Thank you for investing",
+        ]
+        stop_regex = r"|".join(stop_markers)
+        m = re.search(rf"Quantity\s+Price\s+Principal.*?(Total Amount|Net Amount)\s+(?P<tail>.+?)(?:{stop_regex}|$)", w, re.I)
+        if not m:
+            return None, None, None, None
+
+        tail = m.group("tail")
+        # Collect numeric tokens in order of appearance (qty can be integer; others money)
+        tokens = re.findall(r"N/A|\([\$\d,]+(?:\.\d{2,4})?\)|-?\$[\d,]+\.\d{2,4}|-?[\d,]+(?:\.\d{2,4})?", tail)
+        if len(tokens) < 4:
+            return None, None, None, None
+
+        qty = SchwabTradeParser._to_num(tokens[0])
+        price = SchwabTradeParser._to_money(tokens[1])
+        principal = SchwabTradeParser._to_money(tokens[2])
+        total = None
+        # Choose the last money-like token as Total Amount; ensure it looks like money
+        for tok in reversed(tokens):
+            val = SchwabTradeParser._to_money(tok)
+            if val is not None and isinstance(val, float):
+                total = val
+                break
+        return qty, price, principal, total
 
     @staticmethod
     def _to_occ_symbol(underlying: str, expiry: str, cp: str, strike: str) -> Optional[str]:
