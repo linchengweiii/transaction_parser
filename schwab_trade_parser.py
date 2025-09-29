@@ -169,12 +169,19 @@ class SchwabTradeParser(TradeParser):
 
         records: List[Dict[str, Any]] = []
 
-        # Find all occurrences starting at "Symbol:" to support multiple trades per body
-        # Symbols can include digits, dots, dashes, and occasionally slashes
-        for m in re.finditer(r"Symbol:\s*([A-Z0-9\.\-/]+)", text):
-            sym = m.group(1)
+        # Find each trade block by locating "Symbol:" and capturing the following token(s)
+        # up to the next field label (e.g., Security Description/Action/Type/Trade Date)
+        sym_iter = re.finditer(
+            r"Symbol:\s*(?P<sym>.+?)\s+(Security Description:|Action:|Type:|Trade Date:)",
+            text,
+        )
+        for m in sym_iter:
+            raw_sym = (m.group("sym") or "").strip()
             # Parse within a localized window (grow a bit for safety)
             window = text[m.start(): m.start() + 2000]
+
+            # Convert Schwab option symbol to OCC-style if applicable
+            sym = self._normalize_symbol(raw_sym)
 
 
             # Action (buy/sell)
@@ -208,18 +215,23 @@ class SchwabTradeParser(TradeParser):
                 fee = self._to_money(mh.group("fee"))
                 total = self._to_money(mh.group("total"))
             else:
-                # Fallback: scan for first 5 numerical tokens after header
+                # Fallback: collect numeric tokens after the header and map by column ordering.
                 m2 = re.search(r"Quantity\s+Price\s+Principal.*?(Total Amount|Net Amount)\s+(?P<tail>.+)$", window)
                 if m2:
-                    tail = m2.group("tail")[:120]
-                    # Capture N/A, negatives with leading '-', or parentheses like ($12.34)
-                    tokens = re.findall(r"(N/A|\([\$\d,]+(?:\.\d{2,4})?\)|-?\$[\d,]+\.\d{2,4}|-?[\d,]+(?:\.\d{2,4})?)", tail)
-                    if len(tokens) >= 5:
-                        qty = self._to_num(tokens[0])
-                        price = self._to_money(tokens[1])
-                        principal = self._to_money(tokens[2])
-                        fee = self._to_money(tokens[3])
-                        total = self._to_money(tokens[4])
+                    tail = m2.group("tail")
+                    # Capture N/A, negatives, $-prefixed, and parentheses for negatives
+                    nums = re.findall(r"N/A|\([\$\d,]+(?:\.\d{2,4})?\)|-?\$[\d,]+\.\d{2,4}|-?[\d,]+(?:\.\d{2,4})?", tail)
+                    # Expected ordering within the row usually is:
+                    # qty, price, principal, [commission, fees..., fee_total], total_amount
+                    if len(nums) >= 4:
+                        qty = self._to_num(nums[0])
+                        price = self._to_money(nums[1])
+                        principal = self._to_money(nums[2])
+                        # Last numeric in the row should be total amount
+                        total = self._to_money(nums[-1])
+                        # Derive fee as difference when possible
+                        if principal is not None and total is not None:
+                            fee = round(abs(total) - abs(principal), 2)
 
             if sym and qty is not None and price is not None and (total is not None or principal is not None):
                 rec = {
@@ -235,6 +247,50 @@ class SchwabTradeParser(TradeParser):
                 records.append(rec)
 
         return records
+
+    @staticmethod
+    def _to_occ_symbol(underlying: str, expiry: str, cp: str, strike: str) -> Optional[str]:
+        """
+        Build OCC-style symbol: ROOT + YYMMDD + C/P + strikePrice(8 digits, price*1000).
+        Accepts expiry in mm/dd/yy or mm/dd/yyyy; strike as decimal string.
+        Returns None if formatting fails.
+        """
+        try:
+            # Normalize date to yymmdd
+            import datetime as _dt
+            for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+                try:
+                    dt = _dt.datetime.strptime(expiry, fmt)
+                    break
+                except Exception:
+                    dt = None
+            if dt is None:
+                return None
+            yymmdd = dt.strftime("%y%m%d")
+            # Normalize strike -> integer with 3 decimal places
+            s = strike.replace(",", "")
+            strike_thou = int(round(float(s) * 1000))
+            strike_part = f"{strike_thou:08d}"
+            root = underlying.strip().upper().replace(" ", "")
+            cp_ch = cp.upper()[0]
+            return f"{root}{yymmdd}{cp_ch}{strike_part}"
+        except Exception:
+            return None
+
+    def _normalize_symbol(self, raw_sym: str) -> str:
+        """Return OCC-style for options; otherwise the raw equity symbol."""
+        s = " ".join(raw_sym.split())  # normalize whitespace
+        # Option patterns like: "FTNT 09/19/2025 77.00 C" or "AAPL 9/6/25 195 P"
+        m = re.match(
+            r"^(?P<root>[A-Z0-9\.\-]+)\s+(?P<exp>\d{1,2}/\d{1,2}/\d{2,4})\s+(?P<strike>[\d,]+(?:\.\d{1,4})?)\s+(?P<cp>[CP])$",
+            s,
+            re.I,
+        )
+        if m:
+            occ = self._to_occ_symbol(m.group("root"), m.group("exp"), m.group("cp"), m.group("strike"))
+            if occ:
+                return occ
+        return raw_sym
 
     @staticmethod
     def _to_money(s: Optional[str]) -> Optional[float]:
